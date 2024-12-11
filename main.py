@@ -1,5 +1,4 @@
 import os
-import re
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form,WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
@@ -22,138 +21,18 @@ from bs4 import BeautifulSoup
 from urllib.parse import quote
 from pydantic import BaseModel
 import asyncio
-
-
-
-class ApplicantProfile(BaseModel):
-    name: Optional[str] = None
-    email: Optional[str] = None
-    designation: Optional[str] = None
-    skills: List[str] = []
-    experience_level: Optional[str] = None
-    preferred_locations: List[str] = []
-
-class JobListing(BaseModel):
-    title: str
-    company: str
-    location: str
-    link: str
-
-class InteractiveJobChatbot:
-    def __init__(self):
-        self.conversation_stages = [
-            "welcome",
-            "get_name",
-            "get_email",
-            "get_designation",
-            "get_experience_level",
-            "get_skills",
-            "get_locations",
-            "job_search"
-        ]
-        self.conversation_states: Dict[str, Dict] = {}
-
-    def scrape_linkedin_jobs(self, keyword: str, location: str = 'United States') -> List[JobListing]:
-        """Simplified job scraping method"""
-        try:
-            encoded_keyword = quote(keyword)
-            encoded_location = quote(location)
-            url = f"https://www.linkedin.com/jobs/search?keywords={encoded_keyword}&location={encoded_location}"
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            response = requests.get(url, headers=headers)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            jobs = []
-            for job in soup.find_all('div', class_='base-card')[:5]:  # Limit to 5 jobs
-                try:
-                    job_listing = JobListing(
-                        title=job.find('h3', class_='base-search-card__title').text.strip(),
-                        company=job.find('h4', class_='base-search-card__subtitle').text.strip(),
-                        location=job.find('span', class_='job-search-card__location').text.strip(),
-                        link=job.find('a', class_='base-card__full-link')['href']
-                    )
-                    jobs.append(job_listing)
-                except Exception:
-                    continue
-            
-            return jobs
-        except Exception as e:
-            print(f"Job scraping error: {e}")
-            return []
-
-    async def handle_conversation(self, websocket: WebSocket, session_id: str):
-        if session_id not in self.conversation_states:
-            self.conversation_states[session_id] = {
-                "profile": ApplicantProfile(),
-                "current_stage": 0
-            }
-
-        state = self.conversation_states[session_id]
-        current_stage = self.conversation_stages[state['current_stage']]
-        profile = state['profile']
-
-        responses = {
-            "welcome": "👋 Welcome to JobMate! I'll help you find your perfect job. What's your name?",
-            "get_name": f"Nice to meet you! What's your email address?",
-            "get_email": "What job designation are you looking for? (e.g., Software Engineer, Data Scientist)",
-            "get_designation": "What's your experience level? (Entry, Mid, Senior)",
-            "get_experience_level": "What are your key skills? (Separate by commas)",
-            "get_skills": "In which locations are you interested in working?",
-            "get_locations": "Great! Let me find some matching jobs for you...",
-            "job_search": self.generate_job_recommendations(profile)
-        }
-
-        await websocket.send_text(responses[current_stage])
-
-    def process_user_input(self, session_id: str, user_input: str):
-        state = self.conversation_states[session_id]
-        current_stage = self.conversation_stages[state['current_stage']]
-        profile = state['profile']
-
-        input_processors = {
-            "get_name": lambda: setattr(profile, 'name', user_input),
-            "get_email": lambda: setattr(profile, 'email', user_input),
-            "get_designation": lambda: setattr(profile, 'designation', user_input),
-            "get_experience_level": lambda: setattr(profile, 'experience_level', user_input),
-            "get_skills": lambda: setattr(profile, 'skills', [skill.strip() for skill in user_input.split(',')]),
-            "get_locations": lambda: setattr(profile, 'preferred_locations', [loc.strip() for loc in user_input.split(',')])
-        }
-
-        if current_stage in input_processors:
-            input_processors[current_stage]()
-            state['current_stage'] += 1
-
-        return state
-
-    def generate_job_recommendations(self, profile: ApplicantProfile) -> str:
-        # Use the first preferred location or default to United States
-        location = profile.preferred_locations[0] if profile.preferred_locations else 'United States'
-        
-        # Scrape jobs based on designation
-        jobs = self.scrape_linkedin_jobs(profile.designation or 'Software Engineer', location)
-        
-        if not jobs:
-            return "Sorry, no jobs match your current profile. Would you like to try a different search?"
-
-        recommendation = "🌟 Job Recommendations:\n"
-        for idx, job in enumerate(jobs, 1):
-            recommendation += f"{idx}. {job.title} at {job.company}, {job.location}\n   Link: {job.link}\n"
-        
-        recommendation += "\nWould you like to apply to any of these jobs or refine your search?"
-        return recommendation
-
-chatbot = InteractiveJobChatbot()
-
+import uuid
+import urllib.parse
+from urllib.request import Request, urlopen
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
+from chatManager import ChatManager
+from jobScraper import JobScraper
+ 
 # Create FastAPI application with enhanced configurations
-app = FastAPI(
-    title="AI-Powered Resume Ranking Service",
-    description="Advanced backend for ranking resumes against job descriptions",
-    version="1.0.0"
-)
+app = FastAPI()
 
 # Add CORS middleware for cross-origin support
 app.add_middleware(
@@ -164,12 +43,53 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+class ChatbotState:
+    def __init__(self):
+        self.scraper = JobScraper()
+        self.chat_manager = ChatManager()
+
+chat_state = ChatbotState()
+
 # Global resume ranker instance
 resume_ranker = ResumeRanker()
 
 # Ensure upload directory exists
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            
+            # Process chat message
+            response = chat_state.chat_manager.process_message(data)
+            
+            # Check if response is a search command
+            if response.startswith("/search"):
+                _, job_title, job_location = response.split("|")
+                
+                # Send initial confirmation
+                await websocket.send_text(f"Searching for {job_title} jobs in {job_location}...")
+                
+                # Scrape jobs
+                jobs = await chat_state.scraper.scrape_indeed(job_title, job_location)
+                
+                # Set current jobs in chat manager
+                chat_state.chat_manager.set_current_jobs(jobs)
+                
+                # Generate summary
+                summary = f"I found {len(jobs)} job postings. Would you like more details?"
+                await websocket.send_text(summary)
+            else:
+                # Send regular chat response
+                await websocket.send_text(response)
+    
+    except WebSocketDisconnect:
+        print("WebSocket connection closed")
 
 @app.post("/rank-resumes/")
 async def rank_resumes(
@@ -191,7 +111,7 @@ async def rank_resumes(
         resume_paths = []
         for resume in resumes:
             # Generate unique filename
-            unique_filename = f"{uuid.uuid4()}_{resume.filename}"
+            unique_filename = f"{uuid.uuid4()}?{resume.filename}"
             file_path = os.path.join(UPLOAD_DIR, unique_filename)
             
             # Save file
@@ -202,6 +122,10 @@ async def rank_resumes(
         
         # Rank resumes
         ranked_resumes = resume_ranker.rank_resumes(job_description, resume_paths)
+
+        for file_path in resume_paths:
+            if os.path.exists(file_path):
+                os.remove(file_path)
         
         return JSONResponse(content={
             "message": "Resumes ranked successfully",
@@ -210,20 +134,6 @@ async def rank_resumes(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.websocket("/chat/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    try:
-        await chatbot.handle_conversation(websocket, session_id)
-        
-        while True:
-            user_input = await websocket.receive_text()
-            chatbot.process_user_input(session_id, user_input)
-            await chatbot.handle_conversation(websocket, session_id)
-    
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for session {session_id}")
 
 
 @app.get("/health")

@@ -1,6 +1,11 @@
 from typing import List, Dict, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import re
+import os
+import PyPDF2
+import pypdf
+import textract
 class ResumeRanker:
     """
     Advanced resume ranking service with modular design and extensible architecture.
@@ -105,7 +110,7 @@ class ResumeRanker:
         
         ranked_resumes = [
             {
-                "filename": os.path.basename(file),
+                "filename": os.path.basename(file).split('?')[-1],
                 "filepath": file,
                 "similarity_score": float(score)
             }
